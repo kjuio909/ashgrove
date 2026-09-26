@@ -31,7 +31,10 @@ export type {
 } from './interfaces/external/cors-options.interface.js';
 export type { ExceptionFilterMetadata } from './interfaces/exceptions/exception-filter-metadata.interface.js';
 export type { RpcExceptionFilterMetadata } from './interfaces/exceptions/rpc-exception-filter-metadata.interface.js';
-export type { VersionValue } from './interfaces/version-options.interface.js';
+export type {
+  CustomVersioningOptions,
+  VersionValue,
+} from './interfaces/version-options.interface.js';
 export type { GlobalPrefixOptions } from './interfaces/global-prefix-options.interface.js';
 export type {
   MiddlewareConfiguration,

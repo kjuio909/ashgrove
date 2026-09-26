@@ -25,6 +25,7 @@ import { getBodyParserOptions } from './utils/get-body-parser-options.util.js';
 import {
   type CorsOptions,
   type CorsOptionsDelegate,
+  type CustomVersioningOptions,
   type VersionValue,
   addLeadingSlash,
   isFunction,
@@ -50,6 +51,55 @@ type VersionedRoute = <
   next: () => void,
 ) => any;
 
+const VERSIONED_ROUTE_METADATA = Symbol('VERSIONED_ROUTE_METADATA');
+const CUSTOM_VERSIONING_REQUEST_STATE = Symbol(
+  'CUSTOM_VERSIONING_REQUEST_STATE',
+);
+
+/**
+ * Metadata attached to routes wrapped by the custom versioning filter, so the
+ * adapter can track every versioned handler it registers for a given route.
+ */
+interface VersionedRouteMetadata {
+  version: VersionValue;
+  handler: VersionedRoute;
+}
+
+/**
+ * All versioned handlers registered for a single route path and HTTP method.
+ */
+interface CustomVersionedRoute {
+  method: string;
+  path: string;
+  regexp: RegExp;
+  handlersByVersion: Map<string, VersionedRoute>;
+}
+
+/**
+ * Per-request state shared by every custom versioning filter the request
+ * passes through, so the version extractor runs once and at most one handler
+ * is elected per request.
+ */
+interface CustomVersioningRequestState {
+  extractedVersion: string | Array<string>;
+  elected: boolean;
+}
+
+const isNumericVersion = (version: string) =>
+  version.trim() !== '' && !Number.isNaN(Number(version));
+
+/**
+ * Compares two version strings numerically when both look like plain numbers,
+ * and falls back to a numeric-aware, deterministic string comparison
+ * otherwise. The result must not depend on registration or candidate order.
+ */
+function compareVersions(a: string, b: string): number {
+  if (isNumericVersion(a) && isNumericVersion(b)) {
+    return Number(a) - Number(b);
+  }
+  return a.localeCompare(b, undefined, { numeric: true });
+}
+
 /**
  * @publicApi
  */
@@ -60,6 +110,8 @@ export class ExpressAdapter extends AbstractHttpAdapter<
   private readonly logger = new Logger(ExpressAdapter.name);
   private readonly openConnections = new Set<Duplex>();
   private readonly registeredPrefixes = new Set<string>();
+  private versioningOptions?: VersioningOptions;
+  private readonly customVersionedRoutes: CustomVersionedRoute[] = [];
   private isShuttingDown = false;
   private onRequestHook?: (
     req: express.Request,
@@ -390,6 +442,38 @@ export class ExpressAdapter extends AbstractHttpAdapter<
     return true;
   }
 
+  public get(...args: any[]) {
+    return this.registerRoute('get', args);
+  }
+
+  public post(...args: any[]) {
+    return this.registerRoute('post', args);
+  }
+
+  public put(...args: any[]) {
+    return this.registerRoute('put', args);
+  }
+
+  public delete(...args: any[]) {
+    return this.registerRoute('delete', args);
+  }
+
+  public patch(...args: any[]) {
+    return this.registerRoute('patch', args);
+  }
+
+  public options(...args: any[]) {
+    return this.registerRoute('options', args);
+  }
+
+  public head(...args: any[]) {
+    return this.registerRoute('head', args);
+  }
+
+  public all(...args: any[]) {
+    return this.registerRoute('all', args);
+  }
+
   public applyVersionFilter(
     handler: Function,
     version: VersionValue,
@@ -417,8 +501,62 @@ export class ExpressAdapter extends AbstractHttpAdapter<
 
     // Custom Extractor Versioning Handler
     if (versioningOptions.type === VersioningType.CUSTOM) {
+      if (!this.versioningOptions) {
+        this.versioningOptions = versioningOptions;
+      }
+      // The same handler may be bound to several paths; in that case the
+      // version filter is applied only once and reused for every path.
+      if ((handler as any)[VERSIONED_ROUTE_METADATA]) {
+        return handler as VersionedRoute;
+      }
+
       const handlerForCustomVersioning: VersionedRoute = (req, res, next) => {
-        const extractedVersion = versioningOptions.extractor(req);
+        const trackedRoutes =
+          this.versioningOptions?.type === VersioningType.CUSTOM
+            ? this.getCustomVersionedRoutes(req.method)
+            : undefined;
+
+        let extractedVersion: string | Array<string>;
+        if (trackedRoutes) {
+          // Every versioned handler for this HTTP method is tracked, so a
+          // single handler can be elected per request: the one whose
+          // version is the highest version both registered for the matched
+          // route and present in the extracted candidates. The order in
+          // which candidates are carried by the request does not affect
+          // the election, and no other versioned handler for the route
+          // runs once the election happened.
+          const state = this.getCustomVersioningRequestState(
+            req,
+            versioningOptions,
+          );
+          extractedVersion = state.extractedVersion;
+          if (state.elected) {
+            return callNextHandler(req, res, next);
+          }
+
+          const electedHandler = this.electCustomVersionedHandler(
+            trackedRoutes,
+            req,
+            extractedVersion,
+          );
+          if (electedHandler) {
+            state.elected = true;
+            return electedHandler(req, res, next);
+          }
+          if (this.matchesCustomVersionedRoute(trackedRoutes, req.path)) {
+            // A tracked route matches the request path, so the election is
+            // authoritative: no candidate has a registered handler.
+            state.elected = true;
+            return callNextHandler(req, res, next);
+          }
+          // No tracked route matches the request path: this route was
+          // registered outside of the adapter routing methods (e.g.
+          // through "use"); fall back to per-handler matching below.
+        } else {
+          // Routes registered outside of the adapter routing methods (e.g.
+          // through "use") are not tracked: plain per-handler matching.
+          extractedVersion = versioningOptions.extractor(req);
+        }
 
         if (Array.isArray(version)) {
           if (
@@ -435,10 +573,6 @@ export class ExpressAdapter extends AbstractHttpAdapter<
             return handler(req, res, next);
           }
         } else if (isString(version)) {
-          // Known bug here - if there are multiple versions supported across separate
-          // handlers/controllers, we can't select the highest matching handler.
-          // Since this code is evaluated per-handler, then we can't see if the highest
-          // specified version exists in a different handler.
           if (
             Array.isArray(extractedVersion) &&
             extractedVersion.includes(version)
@@ -453,6 +587,11 @@ export class ExpressAdapter extends AbstractHttpAdapter<
 
         return callNextHandler(req, res, next);
       };
+
+      (handlerForCustomVersioning as any)[VERSIONED_ROUTE_METADATA] = {
+        version,
+        handler: handler as VersionedRoute,
+      } satisfies VersionedRouteMetadata;
 
       return handlerForCustomVersioning;
     }
@@ -547,6 +686,152 @@ export class ExpressAdapter extends AbstractHttpAdapter<
       default:
         return error;
     }
+  }
+
+  private registerRoute(method: string, args: any[]) {
+    if (this.versioningOptions?.type === VersioningType.CUSTOM) {
+      for (const arg of args) {
+        const metadata = arg?.[VERSIONED_ROUTE_METADATA] as
+          VersionedRouteMetadata | undefined;
+        if (metadata) {
+          this.trackCustomVersionedRoute(
+            method.toUpperCase(),
+            args[0],
+            metadata,
+          );
+        }
+      }
+    }
+    return this.instance[method](...args);
+  }
+
+  /**
+   * Tracks a versioned handler so the custom versioning election can later
+   * pick the highest registered version among the request candidates.
+   */
+  private trackCustomVersionedRoute(
+    method: string,
+    path: unknown,
+    metadata: VersionedRouteMetadata,
+  ) {
+    if (!isString(path)) {
+      return;
+    }
+    const versions = (
+      Array.isArray(metadata.version) ? metadata.version : [metadata.version]
+    ).filter(isString);
+    if (!versions.length) {
+      return;
+    }
+    let route = this.customVersionedRoutes.find(
+      entry => entry.method === method && entry.path === path,
+    );
+    if (!route) {
+      route = {
+        method,
+        path,
+        regexp: this.pathToRouteRegexp(path),
+        handlersByVersion: new Map(),
+      };
+      this.customVersionedRoutes.push(route);
+    }
+    for (const version of versions) {
+      // Keep the first handler registered for a version, mirroring the
+      // first-match-wins behavior of the underlying router.
+      if (!route.handlersByVersion.has(version)) {
+        route.handlersByVersion.set(version, metadata.handler);
+      }
+    }
+  }
+
+  /**
+   * Compiles a route path to a regular expression using the same matching
+   * semantics ("case sensitive routing" / "strict routing") as the underlying
+   * Express application.
+   */
+  private pathToRouteRegexp(path: string): RegExp {
+    return pathToRegexp(path, {
+      sensitive: !!this.instance?.get?.('case sensitive routing'),
+      trailing: !this.instance?.get?.('strict routing'),
+    }).regexp;
+  }
+
+  /**
+   * Returns the tracked routes the request can reach, in registration order:
+   * routes for the request method interleaved with "all" routes, plus the
+   * GET routes Express falls back to for HEAD requests.
+   */
+  private getCustomVersionedRoutes(
+    method: string,
+  ): CustomVersionedRoute[] | undefined {
+    const routes = this.customVersionedRoutes.filter(
+      route =>
+        route.method === method ||
+        route.method === 'ALL' ||
+        (method === 'HEAD' && route.method === 'GET'),
+    );
+    return routes.length ? routes : undefined;
+  }
+
+  private getCustomVersioningRequestState(
+    req: Record<string | symbol, any>,
+    versioningOptions: CustomVersioningOptions,
+  ): CustomVersioningRequestState {
+    let state = req[CUSTOM_VERSIONING_REQUEST_STATE] as
+      CustomVersioningRequestState | undefined;
+    if (!state) {
+      state = {
+        extractedVersion: versioningOptions.extractor(req),
+        elected: false,
+      };
+      req[CUSTOM_VERSIONING_REQUEST_STATE] = state;
+    }
+    return state;
+  }
+
+  private matchesCustomVersionedRoute(
+    routes: CustomVersionedRoute[],
+    path: string,
+  ): boolean {
+    return routes.some(route => route.regexp.test(path));
+  }
+
+  /**
+   * Elects the handler whose version is the highest version both registered
+   * for the matched route and present in the extracted candidates, or
+   * undefined when no candidate has a registered handler.
+   */
+  private electCustomVersionedHandler(
+    routes: CustomVersionedRoute[],
+    req: Record<string, any>,
+    extractedVersion: string | Array<string>,
+  ): VersionedRoute | undefined {
+    const candidates = (
+      Array.isArray(extractedVersion) ? extractedVersion : [extractedVersion]
+    ).filter(isString);
+    if (!candidates.length) {
+      return undefined;
+    }
+    const path: string = req.path;
+    let electedHandler: VersionedRoute | undefined;
+    let electedVersion: string | undefined;
+    for (const route of routes) {
+      if (!route.regexp.test(path)) {
+        continue;
+      }
+      for (const candidate of candidates) {
+        const handler = route.handlersByVersion.get(candidate);
+        if (
+          handler &&
+          (isUndefined(electedVersion) ||
+            compareVersions(candidate, electedVersion) > 0)
+        ) {
+          electedHandler = handler;
+          electedVersion = candidate;
+        }
+      }
+    }
+    return electedHandler;
   }
 
   private normalizePrefix(prefix?: string): string {

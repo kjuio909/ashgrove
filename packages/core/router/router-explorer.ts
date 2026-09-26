@@ -250,10 +250,12 @@ export class RouterExplorer {
           const httpAdapter = this.container.getHttpAdapterRef();
           const onRouteTriggered = httpAdapter.getOnRouteTriggered?.();
           if (onRouteTriggered) {
-            routerMethodRef(normalizedPath, (...args: unknown[]) => {
+            const wrappedHandler = (...args: unknown[]) => {
               onRouteTriggered(requestMethod, path);
               return routeHandler(...args);
-            });
+            };
+            this.forwardHandlerSymbols(routeHandler, wrappedHandler);
+            routerMethodRef(normalizedPath, wrappedHandler);
           } else {
             routerMethodRef(normalizedPath, routeHandler);
           }
@@ -322,12 +324,25 @@ export class RouterExplorer {
     const httpAdapter = this.container.getHttpAdapterRef();
     const onRouteTriggered = httpAdapter.getOnRouteTriggered?.();
     if (onRouteTriggered) {
-      routerMethodRef(normalizedPath, (...args: unknown[]) => {
+      const wrappedHandler = (...args: unknown[]) => {
         onRouteTriggered(route.method, rawPath);
         return route.handler(...args);
-      });
+      };
+      this.forwardHandlerSymbols(route.handler, wrappedHandler);
+      routerMethodRef(normalizedPath, wrappedHandler);
     } else {
       routerMethodRef(normalizedPath, route.handler);
+    }
+  }
+
+  /**
+   * Copies own symbol properties (e.g. adapter-specific route metadata) from
+   * one route handler to another, so wrapping a handler does not hide the
+   * metadata adapters attach to it.
+   */
+  private forwardHandlerSymbols(source: Function, target: Function) {
+    for (const symbol of Object.getOwnPropertySymbols(source)) {
+      (target as any)[symbol] = (source as any)[symbol];
     }
   }
 
