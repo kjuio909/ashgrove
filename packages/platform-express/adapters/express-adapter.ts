@@ -51,6 +51,51 @@ type VersionedRoute = <
 ) => any;
 
 /**
+ * Marks the route handlers created by "applyVersionFilter" for the CUSTOM
+ * versioning type, so they can be correlated with the routes they were
+ * registered for when inspecting the Express router.
+ */
+const CUSTOM_VERSION_FILTER = Symbol('CUSTOM_VERSION_FILTER');
+
+/**
+ * Tracks, per request, the group of versioned route handlers (same HTTP
+ * method and path) that already produced a response, so that no two handlers
+ * of the same route can write to the response of a single request.
+ */
+const CUSTOM_VERSION_HANDLER_SELECTED = Symbol(
+  'CUSTOM_VERSION_HANDLER_SELECTED',
+);
+
+/**
+ * Compares two version strings segment by segment. Numeric segments are
+ * compared numerically (so that "10" is higher than "2"), any other segments
+ * are compared lexicographically.
+ */
+function compareVersionStrings(a: string, b: string): number {
+  const aSegments = a.split('.');
+  const bSegments = b.split('.');
+  const segmentCount = Math.max(aSegments.length, bSegments.length);
+  for (let i = 0; i < segmentCount; i++) {
+    const aSegment = aSegments[i] ?? '0';
+    const bSegment = bSegments[i] ?? '0';
+    const aNumber = Number(aSegment);
+    const bNumber = Number(bSegment);
+    const comparison =
+      !Number.isNaN(aNumber) && !Number.isNaN(bNumber)
+        ? aNumber - bNumber
+        : aSegment < bSegment
+          ? -1
+          : aSegment > bSegment
+            ? 1
+            : 0;
+    if (comparison !== 0) {
+      return comparison;
+    }
+  }
+  return 0;
+}
+
+/**
  * @publicApi
  */
 export class ExpressAdapter extends AbstractHttpAdapter<
@@ -70,6 +115,10 @@ export class ExpressAdapter extends AbstractHttpAdapter<
     req: express.Request,
     res: express.Response,
   ) => Promise<void> | void;
+  private customVersioningFilterCache?: {
+    routerStackSize: number;
+    versionsByFilter: WeakMap<Function, ReadonlySet<string>>;
+  };
 
   constructor(instance?: any) {
     super(instance || express());
@@ -419,7 +468,49 @@ export class ExpressAdapter extends AbstractHttpAdapter<
     if (versioningOptions.type === VersioningType.CUSTOM) {
       const handlerForCustomVersioning: VersionedRoute = (req, res, next) => {
         const extractedVersion = versioningOptions.extractor(req);
+        const extractedVersions = Array.isArray(extractedVersion)
+          ? extractedVersion
+          : [extractedVersion];
 
+        // All handlers registered for the same route (same HTTP method and
+        // path, possibly across separate controllers) are evaluated as a
+        // group, so that only the handler of the highest requested version is
+        // executed - no matter in which order the handlers were registered or
+        // the versions were supplied by the request.
+        const routeVersions = this.getCustomVersioningFilterVersions().get(
+          handlerForCustomVersioning,
+        );
+        if (routeVersions) {
+          let highestMatchingVersion: string | undefined;
+          for (const routeVersion of routeVersions) {
+            if (
+              extractedVersions.includes(routeVersion) &&
+              (isUndefined(highestMatchingVersion) ||
+                compareVersionStrings(routeVersion, highestMatchingVersion) > 0)
+            ) {
+              highestMatchingVersion = routeVersion;
+            }
+          }
+
+          const handlerVersions = Array.isArray(version) ? version : [version];
+          if (
+            !isUndefined(highestMatchingVersion) &&
+            handlerVersions.includes(highestMatchingVersion) &&
+            (req as any)[CUSTOM_VERSION_HANDLER_SELECTED] !== routeVersions
+          ) {
+            // Ensure that only one handler of this route writes to the
+            // response, even if several handlers declare the highest
+            // matching version
+            (req as any)[CUSTOM_VERSION_HANDLER_SELECTED] = routeVersions;
+            return handler(req, res, next);
+          }
+
+          return callNextHandler(req, res, next);
+        }
+
+        // Fallback for handlers that cannot be correlated with the underlying
+        // router (e.g. handlers wrapped before registration): match on the
+        // version of this handler only
         if (Array.isArray(version)) {
           if (
             Array.isArray(extractedVersion) &&
@@ -435,10 +526,6 @@ export class ExpressAdapter extends AbstractHttpAdapter<
             return handler(req, res, next);
           }
         } else if (isString(version)) {
-          // Known bug here - if there are multiple versions supported across separate
-          // handlers/controllers, we can't select the highest matching handler.
-          // Since this code is evaluated per-handler, then we can't see if the highest
-          // specified version exists in a different handler.
           if (
             Array.isArray(extractedVersion) &&
             extractedVersion.includes(version)
@@ -453,6 +540,10 @@ export class ExpressAdapter extends AbstractHttpAdapter<
 
         return callNextHandler(req, res, next);
       };
+
+      // Tag the filter so it can be correlated with the route it is
+      // registered for when inspecting the Express router
+      (handlerForCustomVersioning as any)[CUSTOM_VERSION_FILTER] = version;
 
       return handlerForCustomVersioning;
     }
@@ -547,6 +638,82 @@ export class ExpressAdapter extends AbstractHttpAdapter<
       default:
         return error;
     }
+  }
+
+  /**
+   * Maps every custom-versioning route handler registered on the Express
+   * instance to the set of versions registered for the same route (same HTTP
+   * method and path), across all handlers and controllers. This allows every
+   * handler to determine whether its own version is the highest one a request
+   * asks for, independently of the route registration order.
+   */
+  private getCustomVersioningFilterVersions(): WeakMap<
+    Function,
+    ReadonlySet<string>
+  > {
+    const routerStack: any[] = this.instance?.router?.stack ?? [];
+    if (
+      this.customVersioningFilterCache &&
+      this.customVersioningFilterCache.routerStackSize === routerStack.length
+    ) {
+      return this.customVersioningFilterCache.versionsByFilter;
+    }
+
+    const versionsByRoute = new Map<string, Set<string>>();
+    const routeKeysByFilter = new Map<Function, string[]>();
+
+    for (const layer of routerStack) {
+      const route = layer?.route;
+      if (!route) {
+        continue;
+      }
+      const routeKeys = Object.keys(route.methods ?? {}).map(
+        method => `${method} ${JSON.stringify(route.path)}`,
+      );
+      for (const routeLayer of route.stack ?? []) {
+        const handle = routeLayer?.handle as
+          (Function & { [CUSTOM_VERSION_FILTER]?: VersionValue }) | undefined;
+        const version = handle?.[CUSTOM_VERSION_FILTER];
+        if (!handle || isUndefined(version)) {
+          continue;
+        }
+        const versions = (Array.isArray(version) ? version : [version]).filter(
+          (v): v is string => isString(v),
+        );
+        routeKeysByFilter.set(handle, routeKeys);
+        for (const routeKey of routeKeys) {
+          let routeVersions = versionsByRoute.get(routeKey);
+          if (!routeVersions) {
+            routeVersions = new Set<string>();
+            versionsByRoute.set(routeKey, routeVersions);
+          }
+          versions.forEach(v => routeVersions!.add(v));
+        }
+      }
+    }
+
+    const versionsByFilter = new WeakMap<Function, ReadonlySet<string>>();
+    for (const [handle, routeKeys] of routeKeysByFilter) {
+      if (routeKeys.length === 1) {
+        // Handlers of the same route share the same set instance, so it can
+        // be used to detect that one of them already produced a response
+        versionsByFilter.set(handle, versionsByRoute.get(routeKeys[0])!);
+        continue;
+      }
+      const versions = new Set<string>();
+      for (const routeKey of routeKeys) {
+        versionsByRoute
+          .get(routeKey)
+          ?.forEach(version => versions.add(version));
+      }
+      versionsByFilter.set(handle, versions);
+    }
+
+    this.customVersioningFilterCache = {
+      routerStackSize: routerStack.length,
+      versionsByFilter,
+    };
+    return versionsByFilter;
   }
 
   private normalizePrefix(prefix?: string): string {
