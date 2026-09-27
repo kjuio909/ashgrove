@@ -25,5 +25,6 @@ export * from './nest-application.js';
 export * from './nest-application-context.js';
 export { IEntryNestModule, NestFactory } from './nest-factory.js';
 export * from './repl/index.js';
+export * from './request-context/index.js';
 export * from './router/index.js';
 export * from './services/index.js';
