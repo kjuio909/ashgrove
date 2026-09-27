@@ -62,7 +62,7 @@ export function rawGet(
 }
 
 /**
- * Polls `/context-records` until `predicate` holds or the timeout elapses.
+ * Polls `/async-records` until `predicate` holds or the timeout elapses.
  */
 export async function waitForRecords(
   port: number,
@@ -72,12 +72,12 @@ export async function waitForRecords(
   const deadline = Date.now() + timeoutMs;
   let records: any[] = [];
   while (Date.now() < deadline) {
-    const result = await rawGet(port, '/context-records');
+    const result = await rawGet(port, '/async-records');
     records = result.body?.records ?? [];
     if (predicate(records)) {
       return records;
     }
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await new Promise(resolve => setTimeout(resolve, 10));
   }
   throw new Error(
     `waitForRecords timed out; last records: ${JSON.stringify(records)}`,
@@ -93,10 +93,35 @@ export async function getPort(app: INestApplication): Promise<number> {
   throw new Error('Expected TCP server address');
 }
 
-export function recordById(records: any[], callbackId: string) {
-  const record = records.find(item => item.callbackId === callbackId);
+export function recordById(records: any[], id: string) {
+  const record = records.find(item => item.id === id);
   if (!record) {
-    throw new Error(`record ${callbackId} not found`);
+    throw new Error(`record ${id} not found`);
   }
   return record;
+}
+
+/**
+ * Resolves once a request to `port` fails with ECONNREFUSED, i.e. the
+ * application stopped accepting new connections.
+ */
+export async function waitForConnectionRefused(
+  port: number,
+  timeoutMs = 5000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const refused = await new Promise<boolean>(resolve => {
+      http
+        .get({ port, path: '/health' }, () => resolve(false))
+        .on('error', error =>
+          resolve((error as NodeJS.ErrnoException).code === 'ECONNREFUSED'),
+        );
+    });
+    if (refused) {
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error(`server on port ${port} still accepts connections`);
 }
