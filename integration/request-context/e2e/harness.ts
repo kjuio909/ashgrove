@@ -1,5 +1,11 @@
 import type { INestApplication } from '@nestjs/common';
+import { FastifyAdapter } from '@nestjs/platform-fastify';
+import { NestFactory } from '@nestjs/core';
 import * as http from 'node:http';
+import type { DynamicModule, Type } from '@nestjs/common';
+import { AppModule } from '../src/app.module.js';
+
+export type HttpPlatform = 'express' | 'fastify';
 
 /**
  * Result of a probe request issued through the raw HTTP client.
@@ -62,7 +68,7 @@ export function rawGet(
 }
 
 /**
- * Polls `/context-records` until `predicate` holds or the timeout elapses.
+ * Polls `/async-records` until `predicate` holds or the timeout elapses.
  */
 export async function waitForRecords(
   port: number,
@@ -72,7 +78,7 @@ export async function waitForRecords(
   const deadline = Date.now() + timeoutMs;
   let records: any[] = [];
   while (Date.now() < deadline) {
-    const result = await rawGet(port, '/context-records');
+    const result = await rawGet(port, '/async-records');
     records = result.body?.records ?? [];
     if (predicate(records)) {
       return records;
@@ -93,10 +99,30 @@ export async function getPort(app: INestApplication): Promise<number> {
   throw new Error('Expected TCP server address');
 }
 
-export function recordById(records: any[], callbackId: string) {
-  const record = records.find(item => item.callbackId === callbackId);
+export function recordById(records: any[], recordId: string) {
+  const record = records.find(item => item.recordId === recordId);
   if (!record) {
-    throw new Error(`record ${callbackId} not found`);
+    throw new Error(`record ${recordId} not found`);
   }
   return record;
+}
+
+/**
+ * Bootstraps the given module on the requested platform without listening.
+ */
+export async function createApp(
+  module: Type<any> | DynamicModule = AppModule,
+  platform: HttpPlatform = 'express',
+  options: { abortOnError?: boolean; logger?: boolean } = {},
+): Promise<INestApplication> {
+  if (platform === 'fastify') {
+    return NestFactory.create(module, new FastifyAdapter(), {
+      logger: options.logger ? undefined : false,
+      abortOnError: options.abortOnError,
+    });
+  }
+  return NestFactory.create(module, {
+    logger: options.logger ? undefined : false,
+    abortOnError: options.abortOnError,
+  });
 }

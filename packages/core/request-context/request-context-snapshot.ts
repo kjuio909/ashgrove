@@ -176,7 +176,7 @@ export class RequestContextSnapshot {
    * Returns the time at which the snapshot was frozen, or `null` beforehand.
    */
   public getTerminatedAt(): Date | null {
-    return this.terminationAt;
+    return this.terminatedAt;
   }
 
   /**
