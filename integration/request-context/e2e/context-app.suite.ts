@@ -141,26 +141,100 @@ function defineSuite(
       });
     });
 
-    it('reports pending while the continuation has not ended', async () => {
-      const probe = await rawGet(port, '/async-context?marker=pending-marker');
-      expect(probe.statusCode).toBe(200);
+    it('distinguishes pending, frozen-running, completed and failed states', async () => {
+      // Hold the response open: the continuation is registered while the
+      // request is still in flight, so the record must read back as
+      // `pending` without a frozen value.
+      const held = rawGet(port, '/async-context?marker=held&delayMs=3000');
+      held.catch(() => {});
 
-      // Response already finished, continuation parked behind its gate: the
-      // readback must report pending rather than a terminal state.
-      const pending = await waitForRecords(
+      const pendingRecords = await waitForRecords(
         port,
-        items => items.length === 1 && items[0].status === 'pending',
+        items =>
+          items.length === 1 &&
+          items[0].status === 'pending' &&
+          items[0].frozenValue === null,
       );
-      expect(pending[0]).toMatchObject({
-        marker: 'pending-marker',
+      const id = pendingRecords[0].id;
+      expect(pendingRecords[0]).toMatchObject({
+        marker: 'held',
+        status: 'pending',
         frozenValue: null,
+        errorMessage: null,
+      });
+
+      // Repeated reads while in flight stay consistent.
+      const pendingReread = (await rawGet(port, '/async-records')).body.records;
+      expect(recordById(pendingReread, id).status).toBe('pending');
+
+      // Abort the held request: the snapshot freezes with the marker, the
+      // freeze watcher captures it and the parked continuation reads back as
+      // `running` - a distinct state from `pending`.
+      held.req!.destroy();
+      const runningRecords = await waitForRecords(
+        port,
+        items =>
+          items.some(item => item.id === id && item.status === 'running') &&
+          items.length === 1,
+      );
+      expect(recordById(runningRecords, id)).toMatchObject({
+        marker: 'held',
+        status: 'running',
+        frozenValue: 'held',
+        errorMessage: null,
+      });
+
+      // The running record stays identical across multiple reads while the
+      // continuation is parked behind its gate.
+      await new Promise(resolve => setTimeout(resolve, 30));
+      const runningReread = (await rawGet(port, '/async-records')).body.records;
+      expect(recordById(runningReread, id)).toMatchObject({
+        status: 'running',
+        frozenValue: 'held',
+      });
+
+      await rawGet(port, `/release-gates?id=${id}`);
+      const completedRecords = await waitForRecords(port, items =>
+        items.some(item => item.id === id && item.status === 'completed'),
+      );
+      expect(recordById(completedRecords, id)).toMatchObject({
+        marker: 'held',
+        status: 'completed',
+        frozenValue: 'held',
+        frozenValueStable: true,
+        lateWriteAccepted: false,
+      });
+
+      // A settled record keeps its state on every later read.
+      await rawGet(port, '/release-gates');
+      await new Promise(resolve => setTimeout(resolve, 30));
+      const finalRead = (await rawGet(port, '/async-records')).body.records;
+      expect(recordById(finalRead, id).status).toBe('completed');
+    }, 15_000);
+
+    it('reports running (frozen) while the parked continuation has not settled', async () => {
+      const probe = await rawGet(port, '/async-context?marker=running-marker');
+      expect(probe.statusCode).toBe(200);
+      const [id] = probe.body.continuationIds;
+
+      // The response already finished: the frozen marker was captured, but
+      // the continuation body is parked behind its gate, so the readback
+      // reports `running` rather than `pending` or a terminal state.
+      const running = await waitForRecords(
+        port,
+        items => items.length === 1 && items[0].status === 'running',
+      );
+      expect(running[0]).toMatchObject({
+        id,
+        marker: 'running-marker',
+        frozenValue: 'running-marker',
         errorMessage: null,
       });
 
       await rawGet(port, '/release-gates');
       const settled = await waitForRecords(
         port,
-        items => items.length === 1 && items[0].status !== 'pending',
+        items => items.length === 1 && items[0].status !== 'running',
       );
       expect(settled[0].status).toBe('completed');
     });
@@ -253,6 +327,13 @@ function defineSuite(
       );
       const other = await rawGet(port, '/async-context?marker=other');
 
+      // While parked, every record reads back as `running` with its frozen
+      // marker - including the continuation that will fail later.
+      await waitForRecords(
+        port,
+        items => items.length === 4 && items.every(r => r.status === 'running'),
+      );
+
       // The failing continuation does not take the application down.
       const health = await rawGet(port, '/health');
       expect(health.statusCode).toBe(200);
@@ -260,7 +341,7 @@ function defineSuite(
       await rawGet(port, '/release-gates');
       const records = await waitForRecords(
         port,
-        items => items.length === 4 && items.every(r => r.status !== 'pending'),
+        items => items.length === 4 && items.every(r => r.status !== 'running'),
       );
 
       const groupRecords = group.body.continuationIds.map((id: string) =>
@@ -268,29 +349,105 @@ function defineSuite(
       );
       expect(groupRecords[0].status).toBe('completed');
       expect(groupRecords[1].status).toBe('failed');
-      expect(groupRecords[1].errorMessage).toContain('group');
-      expect(groupRecords[1].frozenValue).toBeNull();
+      // A failed record keeps the frozen marker and carries a decidable
+      // error message - failure never erases the frozen value.
+      expect(groupRecords[1]).toMatchObject({
+        marker: 'group',
+        frozenValue: 'group',
+        errorMessage: expect.stringContaining('group'),
+      });
       expect(groupRecords[2].status).toBe('completed');
 
       const otherRecord = recordById(records, other.body.continuationIds[0]);
       expect(otherRecord.status).toBe('completed');
       expect(otherRecord.marker).toBe('other');
+      expect(otherRecord.frozenValue).toBe('other');
       expect(otherRecord.errorMessage).toBeNull();
 
       // Settled records are terminal: waiting longer and re-reading never
-      // rewrites a completed record, and the failed one stays failed.
+      // rewrites a completed record, and the failed one stays failed with
+      // the same frozen marker.
       await rawGet(port, '/release-gates');
       await new Promise(resolve => setTimeout(resolve, 30));
       const reread = (await rawGet(port, '/async-records')).body.records;
       expect(recordById(reread, group.body.continuationIds[0]).status).toBe(
         'completed',
       );
-      expect(recordById(reread, group.body.continuationIds[1]).status).toBe(
-        'failed',
-      );
+      const failedAgain = recordById(reread, group.body.continuationIds[1]);
+      expect(failedAgain.status).toBe('failed');
+      expect(failedAgain.frozenValue).toBe('group');
+      expect(failedAgain.errorMessage).toBe(groupRecords[1].errorMessage);
       expect(recordById(reread, other.body.continuationIds[0]).status).toBe(
         'completed',
       );
+    });
+
+    it('captures synchronous continuation throws as failed records without unhandled errors', async () => {
+      const unhandled = trackUnhandledErrors();
+
+      const probe = await rawGet(
+        port,
+        '/async-context?marker=sync-fail&fail=sync',
+      );
+      expect(probe.statusCode).toBe(200);
+      const [id] = probe.body.continuationIds;
+
+      // The synchronous throw happens when the scheduled callback runs; the
+      // gate is never awaited, so no release is needed. The record must
+      // still reach `failed` on its own and retain the frozen marker.
+      const records = await waitForRecords(port, items =>
+        items.some(r => r.id === id && r.status === 'failed'),
+      );
+      expect(recordById(records, id)).toMatchObject({
+        marker: 'sync-fail',
+        frozenValue: 'sync-fail',
+        status: 'failed',
+        errorMessage: expect.stringContaining('synchronous'),
+      });
+
+      // The application stays serviceable and later requests are unaffected.
+      const after = await rawGet(port, '/async-context?marker=after-sync');
+      expect(after.statusCode).toBe(200);
+      await rawGet(port, '/release-gates');
+      await waitForRecords(port, items =>
+        items.some(
+          r =>
+            r.id === after.body.continuationIds[0] && r.status === 'completed',
+        ),
+      );
+
+      // Give the event loop a chance to surface any escaped throw/rejection.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(unhandled.events).toEqual([]);
+      unhandled.restore();
+    });
+
+    it('captures asynchronous continuation rejections as failed records without unhandled rejections', async () => {
+      const unhandled = trackUnhandledErrors();
+
+      const probe = await rawGet(
+        port,
+        '/async-context?marker=async-fail&fail=continuation',
+      );
+      expect(probe.statusCode).toBe(200);
+      const [id] = probe.body.continuationIds;
+
+      await waitForRecords(port, items =>
+        items.some(r => r.id === id && r.status === 'running'),
+      );
+      await rawGet(port, '/release-gates');
+      const records = await waitForRecords(port, items =>
+        items.some(r => r.id === id && r.status === 'failed'),
+      );
+      expect(recordById(records, id)).toMatchObject({
+        marker: 'async-fail',
+        frozenValue: 'async-fail',
+        errorMessage: expect.stringContaining('async-fail'),
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(unhandled.events).toEqual([]);
+      unhandled.restore();
     });
 
     it('never exposes records of another application running in the same process', async () => {
@@ -300,10 +457,11 @@ function defineSuite(
         const probe = await rawGet(port, '/async-context?marker=app-a');
         expect(probe.statusCode).toBe(200);
 
-        // While app A's continuation is pending, app B's readback is empty.
+        // While app A's continuation is parked (frozen, running), app B's
+        // readback is empty.
         await waitForRecords(
           port,
-          items => items.length === 1 && items[0].status === 'pending',
+          items => items.length === 1 && items[0].status === 'running',
         );
         const otherEmpty = await rawGet(otherPort, '/async-records');
         expect(otherEmpty.body.records).toEqual([]);
@@ -369,17 +527,27 @@ function defineSuite(
         setTimeout(() => probe.req!.destroy(), 80);
       });
 
-      const records = await waitForRecords(port, items =>
-        items.some(
-          record => record.marker === 'aborted' && record.status === 'pending',
-        ),
+      // After the abort the snapshot is frozen and the continuation is
+      // scheduled: the record must read back as `running` (never `pending`,
+      // which would mean the marker was lost), exactly once.
+      const records = await waitForRecords(
+        port,
+        items =>
+          items.filter(record => record.marker === 'aborted').length === 1 &&
+          items.some(
+            record =>
+              record.marker === 'aborted' && record.status === 'running',
+          ),
       );
       const id = records.find(r => r.marker === 'aborted')!.id;
+      expect(records).toHaveLength(1);
+      expect(recordById(records, id).frozenValue).toBe('aborted');
 
       await rawGet(port, '/release-gates');
       const settled = await waitForRecords(port, items =>
         items.some(record => record.id === id && record.status === 'completed'),
       );
+      expect(settled).toHaveLength(1);
       expect(recordById(settled, id).frozenValue).toBe('aborted');
     }, 10_000);
 
@@ -413,7 +581,7 @@ function defineSuite(
       const probe = await rawGet(port, '/async-context?marker=shutdown');
       await waitForRecords(
         port,
-        items => items.length === 1 && items[0].status === 'pending',
+        items => items.length === 1 && items[0].status === 'running',
       );
 
       const closingApp = app!;
@@ -437,6 +605,43 @@ function defineSuite(
             .on('error', reject),
         ),
       ).rejects.toMatchObject({ code: 'ECONNREFUSED' });
+    }, 15_000);
+
+    it('drains a failing continuation during shutdown and closes despite its failure', async () => {
+      // Registered before shutdown starts; it rejects once its gate is
+      // released by the store's onModuleDestroy. Shutdown must still drain
+      // it (reading the frozen value), settle its record as `failed` and
+      // complete without surfacing an unhandled rejection.
+      const unhandled = trackUnhandledErrors();
+      const probe = await rawGet(
+        port,
+        '/async-context?marker=shutdown-fail&fail=continuation',
+      );
+      const [id] = probe.body.continuationIds;
+      await waitForRecords(port, items =>
+        items.some(r => r.id === id && r.status === 'running'),
+      );
+
+      const closingApp = app!;
+      const closingPort = port;
+      await closingApp.close();
+      app = undefined;
+
+      const record = closingApp
+        .get(AsyncRecordsStore)
+        .getAll()
+        .find(item => item.id === id)!;
+      expect(record).toMatchObject({
+        marker: 'shutdown-fail',
+        frozenValue: 'shutdown-fail',
+        status: 'failed',
+        errorMessage: expect.stringContaining('shutdown-fail'),
+      });
+
+      await waitForConnectionRefused(closingPort);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(unhandled.events).toEqual([]);
+      unhandled.restore();
     }, 15_000);
 
     it('does not replay records after closing and recreating the application', async () => {
@@ -470,4 +675,27 @@ function defineSuite(
       expect(records.map(r => r.frozenValue)).not.toContain('first-app');
     }, 15_000);
   });
+}
+
+/**
+ * Installs process-level listeners for uncaught exceptions and unhandled
+ * rejections for the duration of one test, so a continuation that lets an
+ * error escape fails the test instead of only printing a warning.
+ */
+function trackUnhandledErrors(): {
+  events: unknown[];
+  restore: () => void;
+} {
+  const events: unknown[] = [];
+  const onException = (error: unknown) => events.push(error);
+  const onRejection = (reason: unknown) => events.push(reason);
+  process.on('uncaughtException', onException);
+  process.on('unhandledRejection', onRejection);
+  return {
+    events,
+    restore: () => {
+      process.removeListener('uncaughtException', onException);
+      process.removeListener('unhandledRejection', onRejection);
+    },
+  };
 }

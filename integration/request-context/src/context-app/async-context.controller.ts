@@ -24,12 +24,25 @@ import { SingletonProbeService } from '../shared/singleton-probe.service.js';
  *
  * - `GET /async-context?marker=...` writes the marker into the request
  *   snapshot, crosses an asynchronous boundary while reading it back,
- *   registers one or more post-response continuations (each parked behind a
+ *   registers post-response continuations (each parked behind a
  *   per-continuation gate until tests release it) and completes the
  *   response.
+ *
+ *   Every continuation is observed through two snapshot callbacks:
+ *   1. a freeze watcher that marks its record `running` (capturing the
+ *      marker from the frozen snapshot) as soon as the response ends;
+ *   2. the continuation body, wrapped so a synchronous throw or an
+ *      asynchronous rejection settles the very same record as `failed`
+ *      without escaping as an unhandled error.
+ *
  * - `GET /async-records` (see {@link AsyncRecordsController}) reads back
  *   every continuation with its current lifecycle state.
  * - `GET /release-gates[?id=...]` releases parked continuation gates.
+ *
+ * Failure modes: `fail=request` (default error response), `fail=filtered`
+ * (custom filter response), `fail=continuation` (asynchronous continuation
+ * rejection), `fail=sync` (synchronous continuation throw) and
+ * `failCallbackIndex=N` (fail only the Nth registered continuation).
  */
 @Controller()
 export class AsyncContextController {
@@ -85,40 +98,44 @@ export class AsyncContextController {
       const registrationIndex = index;
       const continuationId = this.records.register(context.id, marker);
 
+      // Freeze watcher: registered first and therefore scheduled first, it
+      // only reports the freeze and captures the frozen marker. It never
+      // fails, so the marker survives even when the body below throws before
+      // reading anything itself.
       context.registerAfterTerminated(
         async (snapshot: RequestContextSnapshot) => {
+          await snapshot.whenFrozen();
+          this.records.markRunning(
+            continuationId,
+            snapshot.get<string>('marker') ?? null,
+          );
+        },
+      );
+
+      const body = this.createContinuationBody({
+        continuationId,
+        marker,
+        registrationIndex,
+        fail,
+        failingIndex,
+      });
+
+      // Single failure-accounting chokepoint: synchronous throws and
+      // asynchronous rejections both settle the record as `failed` (keeping
+      // the frozen marker captured by the watcher) and never escape. The
+      // snapshot's own per-callback error capture is the second safety net.
+      context.registerAfterTerminated(
+        (snapshot: RequestContextSnapshot): void | Promise<void> => {
+          const frozenMarker = snapshot.get<string>('marker') ?? null;
+          const failRecord = (error: unknown) =>
+            this.records.markFailed(continuationId, error, frozenMarker);
           try {
-            // The body stays parked until the test releases the gate. Until
-            // then `/async-records` reports `pending`, which also covers
-            // "callback registered but not finished yet".
-            await this.records.waitForGate(continuationId);
-
-            if (fail === 'continuation' || failingIndex === registrationIndex) {
-              throw new Error(`intentional continuation failure: ${marker}`);
+            const result = body(snapshot);
+            if (isPromiseLike(result)) {
+              return Promise.resolve(result).catch(failRecord);
             }
-
-            const firstRead = snapshot.get<string>('marker') ?? null;
-            await Promise.resolve();
-            const secondRead = snapshot.get<string>('marker') ?? null;
-
-            // A write attempted after the freeze must be rejected and must
-            // not change the value read back afterwards.
-            const lateWriteAccepted = snapshot.set('lateWrite', marker);
-            const thirdRead = snapshot.get<string>('marker') ?? null;
-
-            this.records.markCompleted(continuationId, {
-              frozenValue: firstRead,
-              frozenValueStable:
-                firstRead === marker &&
-                secondRead === marker &&
-                thirdRead === marker &&
-                !lateWriteAccepted,
-              lateWriteAccepted,
-            });
           } catch (error) {
-            // A failing continuation fails only its own record; sibling
-            // continuations and other requests are untouched.
-            this.records.markFailed(continuationId, error);
+            failRecord(error);
           }
         },
       );
@@ -160,6 +177,61 @@ export class AsyncContextController {
     };
   }
 
+  /**
+   * Builds one continuation body. The body itself never catches: the
+   * registration wrapper owns failure accounting, so the `failed` record is
+   * produced identically for synchronous throws and async rejections.
+   */
+  private createContinuationBody(options: {
+    continuationId: string;
+    marker: string;
+    registrationIndex: number;
+    fail: string | undefined;
+    failingIndex: number | undefined;
+  }): (snapshot: RequestContextSnapshot) => void | Promise<void> {
+    const { continuationId, marker, registrationIndex, fail, failingIndex } =
+      options;
+
+    if (fail === 'sync' && (failingIndex ?? 0) === registrationIndex) {
+      // Intentionally synchronous: the throw happens during the scheduled
+      // callback invocation, before any promise is returned.
+      return () => {
+        throw new Error(
+          `intentional synchronous continuation failure: ${marker}`,
+        );
+      };
+    }
+
+    return async (snapshot: RequestContextSnapshot) => {
+      // The body stays parked until the test releases the gate. Until then
+      // `/async-records` reports `running` (frozen, continuation pending).
+      await this.records.waitForGate(continuationId);
+
+      if (fail === 'continuation' || failingIndex === registrationIndex) {
+        throw new Error(`intentional continuation failure: ${marker}`);
+      }
+
+      const firstRead = snapshot.get<string>('marker') ?? null;
+      await Promise.resolve();
+      const secondRead = snapshot.get<string>('marker') ?? null;
+
+      // A write attempted after the freeze must be rejected and must not
+      // change the value read back afterwards.
+      const lateWriteAccepted = snapshot.set('lateWrite', marker);
+      const thirdRead = snapshot.get<string>('marker') ?? null;
+
+      this.records.markCompleted(continuationId, {
+        frozenValue: firstRead,
+        frozenValueStable:
+          firstRead === marker &&
+          secondRead === marker &&
+          thirdRead === marker &&
+          !lateWriteAccepted,
+        lateWriteAccepted,
+      });
+    };
+  }
+
   @Get(RELEASE_GATES_ROUTE)
   public releaseGates(@Query('id') id?: string) {
     if (id) {
@@ -192,6 +264,14 @@ function parseOptionalIndex(value: string | undefined): number | undefined {
   }
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    !!value &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    typeof (value as PromiseLike<unknown>).then === 'function'
+  );
 }
 
 /**
