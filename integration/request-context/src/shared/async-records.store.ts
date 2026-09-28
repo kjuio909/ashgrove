@@ -5,16 +5,23 @@ import { randomUUID } from 'crypto';
  * Lifecycle of a single post-response continuation, as observed through
  * `/async-records`:
  *
- * - `pending`   - the continuation was registered and has not produced its
- *                 result yet (either the request is still in flight or the
- *                 continuation is parked behind its gate).
+ * - `pending`   - the continuation was registered while the request was still
+ *                 in flight; the snapshot has not been frozen yet and the
+ *                 continuation has not started.
+ * - `running`   - the request ended (response completed, error response sent
+ *                 or client aborted), the snapshot was frozen and the
+ *                 continuation is currently executing - parked behind its
+ *                 gate, awaiting, or otherwise in progress.
  * - `completed` - the continuation read the frozen snapshot successfully.
- * - `failed`    - the continuation threw or rejected; the error was captured.
+ * - `failed`    - the continuation threw synchronously or rejected; the error
+ *                 was captured while the frozen marker is retained.
  *
- * A settled record is reported forever as `completed`/`failed`: it can never
- * go back to `pending`.
+ * A record moves `pending -> running -> completed|failed` exactly once. The
+ * two terminal states are permanent: a record can never go back to a
+ * non-terminal state, never complete twice, never fail twice and never get
+ * overwritten by a late settlement.
  */
-export type ContinuationStatus = 'pending' | 'completed' | 'failed';
+export type ContinuationStatus = 'pending' | 'running' | 'completed' | 'failed';
 
 export interface ContinuationRecord {
   id: string;
@@ -96,6 +103,19 @@ export class AsyncRecordsStore implements OnModuleDestroy {
     this.gates.forEach(gate => gate.release());
   }
 
+  public markRunning(id: string, frozenValue: string | null): void {
+    const record = this.records.get(id);
+    if (!record || record.status !== 'pending') {
+      // A continuation starts exactly once; duplicates and late calls on a
+      // settled record are ignored.
+      return;
+    }
+    // Capture the frozen marker up front, so it survives even a continuation
+    // that throws before reaching its own read (including synchronously).
+    record.frozenValue = frozenValue;
+    record.status = 'running';
+  }
+
   public markCompleted(
     id: string,
     payload: Pick<ContinuationRecord, 'frozenValue' | 'frozenValueStable'> & {
@@ -103,7 +123,11 @@ export class AsyncRecordsStore implements OnModuleDestroy {
     },
   ): void {
     const record = this.records.get(id);
-    if (!record || record.status !== 'pending') {
+    if (
+      !record ||
+      record.status === 'completed' ||
+      record.status === 'failed'
+    ) {
       // A settled record is immutable: a late settlement can never rewrite a
       // completed or failed record.
       return;
@@ -113,12 +137,19 @@ export class AsyncRecordsStore implements OnModuleDestroy {
 
   public markFailed(id: string, error: unknown): void {
     const record = this.records.get(id);
-    if (!record || record.status !== 'pending') {
+    if (
+      !record ||
+      record.status === 'completed' ||
+      record.status === 'failed'
+    ) {
       return;
     }
     record.status = 'failed';
     record.errorMessage =
       error instanceof Error ? error.message : String(error);
+    // `frozenValue` was captured when the continuation started and is
+    // intentionally left untouched: a failed record still carries the frozen
+    // marker.
   }
 
   /**

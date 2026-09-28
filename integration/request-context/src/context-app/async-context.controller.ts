@@ -85,12 +85,40 @@ export class AsyncContextController {
       const registrationIndex = index;
       const continuationId = this.records.register(context.id, marker);
 
+      if (fail === 'continuationSync') {
+        // A non-async continuation that throws synchronously the moment the
+        // snapshot invokes it. It never awaits its gate, so the failure lands
+        // immediately after the freeze; the request-context core must capture
+        // the synchronous throw (no unhandled exception), while the record is
+        // marked failed carrying the frozen marker.
+        context.registerAfterTerminated((snapshot: RequestContextSnapshot) => {
+          const frozenAtStart = snapshot.get<string>('marker') ?? null;
+          this.records.markRunning(continuationId, frozenAtStart);
+          try {
+            throw new Error(
+              `intentional synchronous continuation failure: ${marker}`,
+            );
+          } catch (error) {
+            this.records.markFailed(continuationId, error);
+            throw error;
+          }
+        });
+        continuationIds.push(continuationId);
+        continue;
+      }
+
       context.registerAfterTerminated(
         async (snapshot: RequestContextSnapshot) => {
+          // The snapshot is frozen the moment the continuation starts.
+          // Capture the frozen marker before anything that could throw so an
+          // asynchronous rejection still leaves a record that carries it.
+          const frozenAtStart = snapshot.get<string>('marker') ?? null;
+          this.records.markRunning(continuationId, frozenAtStart);
           try {
             // The body stays parked until the test releases the gate. Until
-            // then `/async-records` reports `pending`, which also covers
-            // "callback registered but not finished yet".
+            // then `/async-records` reports `running` (frozen, continuation
+            // in flight), which also covers "callback registered and started
+            // but not finished yet".
             await this.records.waitForGate(continuationId);
 
             if (fail === 'continuation' || failingIndex === registrationIndex) {
